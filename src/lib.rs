@@ -13,47 +13,48 @@ pub extern crate sqa_jack;
 extern crate bounded_spsc_queue;
 extern crate time;
 extern crate arrayvec;
-#[macro_use]
-extern crate error_chain;
+extern crate failure;
+#[macro_use] extern crate failure_derive;
 extern crate parking_lot;
 extern crate uuid;
 
 pub mod errors;
 pub mod sync;
+pub mod param;
 mod thread;
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, AtomicU64, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicUsize, AtomicU64, AtomicPtr};
 use std::sync::atomic::Ordering::*;
 use bounded_spsc_queue::Producer;
 use arrayvec::ArrayVec;
 use std::sync::Arc;
-use std::mem;
 use time::Duration;
 use sqa_jack::*;
 pub use errors::EngineResult;
-use errors::{ErrorKind};
+use errors::EngineError;
+use param::Parameter;
 pub use uuid::Uuid;
 pub use sqa_jack as jack;
 /// The maximum amount of streams that can play concurrently.
 ///
-/// Can be increased to 512 with the `512-players` feature.
-#[cfg(not(feature = "512-players"))]
+/// Can be increased to 512 with the `players-512` feature.
+#[cfg(not(feature = "players-512"))]
 pub const MAX_PLAYERS: usize = 256;
-#[cfg(feature = "512-players")]
+#[cfg(feature = "players-512")]
 pub const MAX_PLAYERS: usize = 512;
 /// The maximum amount of channels that can be created.
 ///
-/// Can be increased to 128 with the `128-channels` feature.
-#[cfg(not(feature = "128-channels"))]
+/// Can be increased to 128 with the `channels-128` feature.
+#[cfg(not(feature = "channels-128"))]
 pub const MAX_CHANS: usize = 64;
-#[cfg(feature = "128-channels")]
+#[cfg(feature = "channels-128")]
 pub const MAX_CHANS: usize = 128;
 /// The size of a stream's buffer, in samples.
 pub const STREAM_BUFFER_SIZE: usize = 100_000;
 /// The size of the communication buffer between audio thread and main thread, in messages.
 pub const CONTROL_BUFFER_SIZE: usize = MAX_PLAYERS * 2;
 /// One second, in nanoseconds.
-const ONE_SECOND_IN_NANOSECONDS: u64 = 1_000_000_000;
+pub const ONE_SECOND_IN_NANOSECONDS: u64 = 1_000_000_000;
 
 /// Corresponds to, and controls, a `Player` in the audio thread.
 pub struct Sender<T> {
@@ -63,12 +64,16 @@ pub struct Sender<T> {
     active: Arc<AtomicBool>,
     /// Whether this stream is dead (rw)
     alive: Arc<AtomicBool>,
+    /// Whether this stream will die when its buffer runs out (rw)
+    kill_when_empty: Arc<AtomicBool>,
     /// When (from the system's monotonic clock) the player should begin playback (rw)
     start_time: Arc<AtomicU64>,
     /// Which channel number this stream is patched to (rw)
     output_patch: Arc<AtomicUsize>,
-    /// The playback volume (actually a f32 transmuted!) (rw)
-    volume: Arc<AtomicU32>,
+    /// The playback volume (rw)
+    volume: Arc<AtomicPtr<Parameter<f32>>>,
+    /// The master playback volume (rw)
+    master_vol: Arc<AtomicPtr<Parameter<f32>>>,
     /// The buffer to write to (or not) - will be a `bounded_spsc_queue::Producer<f32>` or `()`.
     pub buf: T,
     /// The sample rate of this sender. Can differ from the output sample rate.
@@ -83,6 +88,14 @@ pub type BufferSender = Sender<Producer<f32>>;
 /// A `Sender` which cannot write data to its `Player`'s buffer.
 pub type PlainSender = Sender<()>;
 impl<T> Sender<T> {
+    /// Set whether this stream will die when its buffer runs out.
+    pub fn set_kill_when_empty(&mut self, val: bool) {
+        self.kill_when_empty.store(val, Relaxed);
+    }
+    /// Query whether this stream will die when its buffer runs out.
+    pub fn kill_when_empty(&mut self) -> bool {
+        self.kill_when_empty.load(Relaxed)
+    }
     /// Set whether this stream will play samples or not.
     ///
     /// This essentially halts all processing related to the sender's `Player`.
@@ -103,23 +116,39 @@ impl<T> Sender<T> {
         self.set_start_time(time);
         self.set_active(true);
     }
+    pub fn set_master_volume(&mut self, vol: Box<Parameter<f32>>) {
+        let val = Box::into_raw(vol);
+        let old_ptr = self.master_vol.swap(val, AcqRel);
+        unsafe {
+            let _: Box<Parameter<f32>> = Box::from_raw(old_ptr);
+        }
+    }
+    pub fn master_volume(&self) -> Parameter<f32> {
+        let ret;
+        unsafe {
+            let val = self.master_vol.load(Acquire);
+            ret = (*val).clone();
+            self.master_vol.store(val, Release);
+        }
+        ret
+    }
     /// Set the volume of this stream.
-    ///
-    /// This volume is linear: a value of `1.0` means 0dB.
-    pub fn set_volume(&mut self, vol: f32) {
-        let val = unsafe {
-            mem::transmute::<f32, u32>(vol)
-        };
-        self.volume.store(val, Relaxed);
+    pub fn set_volume(&mut self, vol: Box<Parameter<f32>>) {
+        let val = Box::into_raw(vol);
+        let old_ptr = self.volume.swap(val, AcqRel);
+        unsafe {
+            let _: Box<Parameter<f32>> = Box::from_raw(old_ptr);
+        }
     }
     /// Get the volume of this stream.
-    ///
-    /// This volume is linear: a value of `1.0` means 0dB.
-    pub fn volume(&self) -> f32 {
-        let val = self.volume.load(Relaxed);
+    pub fn volume(&self) -> Parameter<f32> {
+        let ret;
         unsafe {
-            mem::transmute::<u32, f32>(val)
+            let val = self.volume.load(Acquire);
+            ret = (*val).clone();
+            self.volume.store(val, Release);
         }
+        ret
     }
     /// Get whether this stream will play samples or not.
     pub fn active(&self) -> bool {
@@ -176,6 +205,8 @@ impl<T> Sender<T> {
             start_time: self.start_time.clone(),
             output_patch: self.output_patch.clone(),
             volume: self.volume.clone(),
+            master_vol: self.master_vol.clone(),
+            kill_when_empty: self.kill_when_empty.clone(),
             buf: (),
             sample_rate: self.sample_rate,
             original: false,
@@ -204,7 +235,8 @@ impl<T> Drop for Sender<T> {
 /// Main engine context, containing a connection to JACK.
 pub struct EngineContext {
     pub conn: JackConnection<Activated>,
-    pub chans: ArrayVec<[JackPort; MAX_CHANS]>,
+    pub chans: ArrayVec<[Option<JackPort>; MAX_CHANS]>,
+    pub holes: ArrayVec<[usize; MAX_CHANS]>,
     length: Arc<AtomicUsize>,
     control: Producer<thread::AudioThreadCommand>,
     rx: Option<sync::AudioThreadHandle>
@@ -221,6 +253,7 @@ impl EngineContext {
         let dctx = thread::DeviceContext {
             players: ArrayVec::new(),
             chans: ArrayVec::new(),
+            holes: ArrayVec::new(),
             control: c,
             length: len.clone(),
             sample_rate: conn.sample_rate() as u64,
@@ -234,6 +267,7 @@ impl EngineContext {
         Ok(EngineContext {
             conn: conn,
             chans: ArrayVec::new(),
+            holes: ArrayVec::new(),
             length: len,
             control: p,
             rx: Some(rc)
@@ -256,25 +290,54 @@ impl EngineContext {
         self.length.load(Relaxed)
     }
     pub fn new_channel(&mut self, name: &str) -> EngineResult<usize> {
+        /* NOTE: This code must mirror the code in thread.rs */
         let port = self.conn.register_port(name, PORT_IS_OUTPUT | PORT_IS_TERMINAL)?;
-        if self.chans.len() == self.chans.capacity() {
-            Err(ErrorKind::LimitExceeded)?
+        if (self.chans.len() - self.holes.len()) == self.chans.capacity() - 1 {
+            Err(EngineError::LimitExceeded)?
+        }
+        let ret;
+        if let Some(ix) = self.holes.remove(0) {
+            self.chans[ix] = Some(port);
+            ret = ix;
+        }
+        else {
+            ret = self.chans.len();
+            self.chans.push(Some(port));
         }
         self.control.push(thread::AudioThreadCommand::AddChannel(port.clone()));
-        self.chans.push(port);
-        Ok(self.chans.len()-1)
+        Ok(ret)
+    }
+    pub fn remove_channel(&mut self, idx: usize) -> EngineResult<()> {
+        /* NOTE: This code must mirror the code in thread.rs */
+        if idx >= self.chans.len() || self.holes.contains(&idx) {
+            Err(EngineError::NoSuchChannel)?
+        }
+        self.chans.push(None);
+        self.holes.push(idx);
+        self.control.push(thread::AudioThreadCommand::RemoveChannel(idx));
+        self.conn.unregister_port(self.chans.swap_remove(idx).unwrap().unwrap())?;
+        Ok(())
     }
     pub fn new_sender(&mut self, sample_rate: u64) -> BufferSender {
+        self.new_sender_ext(sample_rate, None)
+    }
+    pub fn new_sender_with_master<T>(&mut self, master: &Sender<T>) -> BufferSender {
+        let master_vol = master.master_vol.clone();
+        self.new_sender_ext(master.sample_rate, Some(master_vol))
+    }
+    fn new_sender_ext(&mut self, sample_rate: u64, master_vol: Option<Arc<AtomicPtr<Parameter<f32>>>>) -> BufferSender {
         let (p, c) = bounded_spsc_queue::make(STREAM_BUFFER_SIZE);
         let active = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(false));
+        let kill_when_empty = Arc::new(AtomicBool::new(false));
         let position = Arc::new(AtomicU64::new(0));
         let start_time = Arc::new(AtomicU64::new(0));
-        let one_f32_in_u32 = unsafe {
-            mem::transmute::<f32, u32>(1.0)
-        };
-        let volume = Arc::new(AtomicU32::new(one_f32_in_u32));
-        let output_patch = Arc::new(AtomicUsize::new(MAX_CHANS));
+        let default_volume = Box::new(Parameter::Raw(1.0));
+        let default_master_vol = default_volume.clone();
+        let volume = Arc::new(AtomicPtr::new(Box::into_raw(default_volume)));
+        let master_vol = master_vol.unwrap_or(
+            Arc::new(AtomicPtr::new(Box::into_raw(default_master_vol))));
+        let output_patch = Arc::new(AtomicUsize::new(::std::usize::MAX));
         let uu = Uuid::new_v4();
 
         self.control.push(thread::AudioThreadCommand::AddPlayer(thread::Player {
@@ -286,7 +349,11 @@ impl EngineContext {
             alive: alive.clone(),
             output_patch: output_patch.clone(),
             volume: volume.clone(),
-            uuid: uu
+            master_vol: master_vol.clone(),
+            kill_when_empty: kill_when_empty.clone(),
+            uuid: uu,
+            half_sent: false,
+            empty_sent: false
         }));
 
         Sender {
@@ -298,6 +365,8 @@ impl EngineContext {
             start_time: start_time,
             sample_rate: sample_rate,
             volume: volume.clone(),
+            master_vol: master_vol.clone(),
+            kill_when_empty: kill_when_empty.clone(),
             original: true,
             uuid: uu
         }
